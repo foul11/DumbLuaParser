@@ -1,12 +1,13 @@
 --[=[===========================================================
---=
+--=  Modified foul11: add 'continue' statement and glua specific operands (!=, ||, &&, !)
+--=  
 --=  Dumb Lua Parser - Lua parsing library
 --=  by Marcus 'ReFreezed' Thunström
 --=
 --=  Tokenize Lua code or create ASTs (Abstract Syntax Trees)
 --=  and convert the data back to Lua.
 --=
---=  Version: 2.3 (2022-06-23)
+--=  Version: 2.3.0g (2023-05-27)
 --=
 --=  License: MIT (see the bottom of this file)
 --=  Website: http://refreezed.com/luaparser/
@@ -386,6 +387,7 @@ Node types:
 	"binary"      -- Binary expression (operation with two operands, e.g. "+" or "and").
 	"block"       -- List of statements. Blocks inside blocks are 'do...end' statements.
 	"break"       -- Loop break statement.
+	"continue"    -- Loop continue statement.
 	"call"        -- Function call.
 	"declaration" -- Declaration of one or more local variables, possibly with initial values.
 	"for"         -- A 'for' loop.
@@ -454,7 +456,7 @@ Special number notation rules.
 
 -============================================================]=]
 
-local PARSER_VERSION = "2.3.0"
+local PARSER_VERSION = "2.3.0g"
 
 local NORMALIZE_MINUS_ZERO, HANDLE_ENV -- Should HANDLE_ENV be a setting?
 do
@@ -470,7 +472,7 @@ end
 local assert       = assert
 local error        = error
 local ipairs       = ipairs
-local loadstring   = loadstring or load
+local loadstring   = loadstring or load or CompileString
 local pairs        = pairs
 local print        = print
 local select       = select
@@ -478,8 +480,8 @@ local tonumber     = tonumber
 local tostring     = tostring
 local type         = type
 
-local ioOpen       = io.open
-local ioWrite      = io.write
+local ioOpen       = nil -- io.open
+local ioWrite      = Msg -- io.write
 
 local jit          = jit
 
@@ -534,6 +536,7 @@ end
 local KEYWORDS = newSet{
 	"and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if",
 	"in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+	'continue',  -- glua
 }
 local PUNCTUATION = newSet{
 	"+",  "-",  "*",  "/",  "%",  "^",  "#",
@@ -541,20 +544,23 @@ local PUNCTUATION = newSet{
 	"==", "~=", "<=", ">=", "<",  ">",  "=",
 	"(",  ")",  "{",  "}",  "[",  "]",  "::",
 	";",  ":",  ",",  ".",  "..", "...",
+	'!=', '&&', '||', '!',  -- glua
 }
 local OPERATORS_UNARY = newSet{
 	"-", "not", "#", "~",
+	'!',  -- glua
 }
 local OPERATORS_BINARY = newSet{
 	"+",   "-",  "*", "/",  "//", "^", "%",
 	"&",   "~",  "|", ">>", "<<", "..",
 	"<",   "<=", ">", ">=", "==", "~=",
 	"and", "or",
+	'!=', '&&', '||',  -- glua
 }
 local OPERATOR_PRECEDENCE = {
-	["or"]  = 1,
-	["and"] = 2,
-	["<"]   = 3,  [">"] = 3, ["<="] = 3, [">="] = 3, ["~="] = 3, ["=="] = 3,
+	["or"]  = 1, ['||'] = 1,
+	["and"] = 2, ['&&'] = 2,
+	["<"]   = 3,  [">"] = 3, ["<="] = 3, [">="] = 3, ["~="] = 3, ["=="] = 3, ["!="] = 3,
 	["|"]   = 4,
 	["~"]   = 5,
 	["&"]   = 6,
@@ -567,17 +573,19 @@ local OPERATOR_PRECEDENCE = {
 }
 
 local EXPRESSION_NODES = newSet{ "binary", "call", "function", "identifier", "literal", "lookup", "table", "unary", "vararg" }
-local STATEMENT_NODES  = newSet{ "assignment", "block", "break", "call", "declaration", "for", "goto", "if", "label", "repeat", "return", "while" }
+local STATEMENT_NODES  = newSet{ "assignment", "block", "break", "call", "declaration", "for", "goto", "if", "label", "repeat", "return", "while", 'continue' }
 
 local TOKEN_BYTES = {
 	NAME_START      = newCharSet"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_",
+	SLASH           = newCharSet"/", -- for c-like comment
+	STAR            = newCharSet"*", -- for c-like comment
 	DASH            = newCharSet"-",
 	NUM             = newCharSet"0123456789",
 	QUOTE           = newCharSet"\"'",
 	SQUARE          = newCharSet"[",
 	DOT             = newCharSet".",
-	PUNCT_TWO_CHARS = newCharSet".=~<>:/<>",
-	PUNCT_ONE_CHAR  = newCharSet"+-*/%^#<>=(){}[];:,.&~|",
+	PUNCT_TWO_CHARS = newCharSet".=~<>:/<>&|!",
+	PUNCT_ONE_CHAR  = newCharSet"+-*/%^#<>=(){}[];:,.&~|!",
 }
 
 local NUMERAL_PATTERNS = {
@@ -684,6 +692,9 @@ local function AstFunction (token)return populateCommonNodeFields(token,{
 local function AstBreak (token)return populateCommonNodeFields(token,{
 	type        = "break",
 })end
+local function AstContinue (token)return populateCommonNodeFields(token,{
+	type        = "continue",
+})end
 local function AstReturn (token)return populateCommonNodeFields(token,{
 	type        = "return",
 	values      = {},    -- Array of expressions.
@@ -748,6 +759,7 @@ local CHILD_FIELDS = {
 	["call"]        = {callee="node", arguments="nodearray"},
 	["function"]    = {parameters="nodearray", body="node"},
 	["break"]       = {},
+	["continue"]    = {},
 	["return"]      = {values="nodearray"},
 	["label"]       = {},
 	["goto"]        = {},
@@ -1160,6 +1172,30 @@ do
 
 		return true, equalSignCountIfLong, ptr
 	end
+	
+	-- success, ptr = parseDoubleSlashComment( s, ptr )
+	local function parseDoubleSlashComment(s, ptr)
+		-- Single line (comment).
+		
+		local i1, i2 = stringFind(s, "\n", ptr)
+		ptr          = i2 and i2 + 1 or #s + 1
+
+		return true, ptr
+	end
+	
+	-- success, errorCode, ptr = parseSlashStarComment( s, ptr )
+	local function parseSlashStarComment(s, ptr)
+		-- Multiline.
+
+		local i1, i2 = stringFind(s, "*/", ptr, true)
+		if not i1 then
+			return false, ERROR_UNFINISHED_VALUE, 0
+		end
+
+		ptr = i2 + 1
+
+		return true, equalSignCountIfLong, ptr
+	end
 
 	local function codepointToString(cp, buffer)
 		if cp < 0 or cp > 0x10ffff then
@@ -1312,6 +1348,8 @@ do
 		local ln     = 1
 
 		local BYTES_NAME_START      = TOKEN_BYTES.NAME_START
+		local BYTES_SLASH           = TOKEN_BYTES.SLASH
+		local BYTES_STAR            = TOKEN_BYTES.STAR
 		local BYTES_DASH            = TOKEN_BYTES.DASH
 		local BYTES_NUM             = TOKEN_BYTES.NUM
 		local BYTES_QUOTE           = TOKEN_BYTES.QUOTE
@@ -1404,6 +1442,47 @@ do
 				tokRepr  = stringSub(s, ptrStart, ptr-1)
 				tokRepr  = equalSignCountIfLong and tokRepr or (stringFind(tokRepr, "\n$") and tokRepr or tokRepr.."\n") -- Make sure there's a newline at the end of single-line comments. (It may be missing if we've reached EOF.)
 				tokValue = equalSignCountIfLong and stringSub(tokRepr, 5+equalSignCountIfLong, -3-equalSignCountIfLong) or stringSub(tokRepr, 3, -2)
+
+			-- Comment double slash (//).
+			elseif BYTES_SLASH[b1] and BYTES_SLASH[b2] then
+				ptr = ptr + 2
+
+				local ok
+				ok, ptr = parseDoubleSlashComment(s, ptr)
+
+				if not ok then
+					return nil, formatErrorInFile(s, path, ptrStart, "Tokenizer", "Invalid comment.")
+				end
+
+				tokType  = "comment"
+				tokRepr  = stringSub(s, ptrStart, ptr-1)
+				tokRepr  = stringFind(tokRepr, "\n$") and tokRepr or tokRepr.."\n"  -- Make sure there's a newline at the end of single-line comments. (It may be missing if we've reached EOF.)
+				tokValue = stringSub(tokRepr, 3, -2)
+
+			-- Comment slash star (/*).
+			elseif BYTES_SLASH[b1] and BYTES_STAR[b2] then
+				ptr = ptr + 2
+
+				local ok
+				ok, err, ptr = parseSlashStarComment(s, ptr)
+
+				if not ok then
+					if err == ERROR_UNFINISHED_VALUE then
+						return nil, formatErrorInFile(s, path, ptrStart, "Tokenizer", "Unfinished long comment.")
+					else
+						return nil, formatErrorInFile(s, path, ptrStart, "Tokenizer", "Invalid comment.")
+					end
+				end
+
+				-- Check for nesting of /*...*/
+				local pos = stringFind(s, "/*", ptrStart + 2, true)
+				if pos and pos < ptr then
+					return nil, formatErrorInFile(s, path, pos, "Tokenizer", "Cannot have nested comments. (Comment starting %s)", getRelativeLocationText(lnStart, getLineNumber(s, pos)))
+				end
+
+				tokType  = "comment"
+				tokRepr  = stringSub(s, ptrStart, ptr-1)
+				tokValue = stringSub(tokRepr, 3, -3)
 
 			-- Number.
 			elseif BYTES_NUM[b1] or (BYTES_DOT[b1] and BYTES_NUM[b2]) then
@@ -1541,7 +1620,7 @@ do
 				tokType = "string"
 				tokRepr = stringSub(s, ptrStart, ptr-1)
 
-				local chunk = loadstring("return "..tokRepr, "@") -- Try to make Lua parse the string value before we fall back to our own parser which is probably slower.
+				local chunk = nil -- loadstring("return "..tokRepr, "@") -- Try to make Lua parse the string value before we fall back to our own parser which is probably slower.
 				if chunk then
 					tokValue = chunk()
 					assert(type(tokValue) == "string")
@@ -1582,7 +1661,7 @@ do
 				tokType  = "punctuation"
 				tokRepr  = stringSub(s, ptrStart, ptr-1)
 				tokValue = tokRepr
-			elseif BYTES_PUNCT_TWO_CHARS[b1] and stringFind(s, "^%.%.", ptr) or stringFind(s, "^[=~<>]=", ptr) or stringFind(s, "^::", ptr) or stringFind(s, "^//", ptr) or stringFind(s, "^<<", ptr) or stringFind(s, "^>>", ptr) then
+			elseif BYTES_PUNCT_TWO_CHARS[b1] and stringFind(s, "^%.%.", ptr) or stringFind(s, "^[=~<>!]=", ptr) or stringFind(s, "^::", ptr) or stringFind(s, "^//", ptr) or stringFind(s, "^<<", ptr) or stringFind(s, "^>>", ptr) then
 				ptr      = ptr + 2
 				tokType  = "punctuation"
 				tokRepr  = stringSub(s, ptrStart, ptr-1)
@@ -2729,6 +2808,14 @@ local function parseOneOrPossiblyMoreStatements(tokens, tokStart, statements) --
 		tableInsert(statements, breakNode)
 		return true, tok
 
+	-- continue
+	elseif isToken(currentToken, "keyword", "continue") then
+		local continueNode = AstContinue(currentToken)
+		tok                = tok + 1 -- 'continue'
+
+		tableInsert(statements, continueNode)
+		return true, tok
+
 	-- return (last)
 	elseif isToken(currentToken, "keyword", "return") then
 		local returnNode = AstReturn(currentToken)
@@ -2981,6 +3068,7 @@ local nodeConstructors = {
 	["call"]        = function()  return AstCall       (nil)  end,
 	["function"]    = function()  return AstFunction   (nil)  end,
 	["break"]       = function()  return AstBreak      (nil)  end,
+	["continue"]    = function()  return AstContinue   (nil)  end,
 	["return"]      = function()  return AstReturn     (nil)  end,
 	["block"]       = function()  return AstBlock      (nil)  end,
 	["declaration"] = function()  return AstDeclaration(nil)  end,
@@ -3083,6 +3171,7 @@ local nodeConstructorsFast = {
 	["call"]        = function()  return AstCall       (nil)  end,
 	["function"]    = function()  return AstFunction   (nil)  end,
 	["break"]       = function()  return AstBreak      (nil)  end,
+	["continue"]    = function()  return AstContinue   (nil)  end,
 	["return"]      = function()  return AstReturn     (nil)  end,
 	["block"]       = function()  return AstBlock      (nil)  end,
 	["declaration"] = function()  return AstDeclaration(nil)  end,
@@ -3120,6 +3209,7 @@ local nodeConstructorsFast = {
 -- call         = newNode( "call" )
 -- functionNode = newNode( "function" )
 -- breakNode    = newNode( "break" )
+-- continueNode = newNode( "continue" )
 -- returnNode   = newNode( "return" )
 -- label        = newNode( "label", labelName )
 -- gotoNode     = newNode( "goto",  labelName )
@@ -3163,6 +3253,9 @@ local function cloneNodeAndMaybeChildren(node, cloneChildren)
 
 	elseif nodeType == "break" then
 		clone = AstBreak(nil)
+
+	elseif nodeType == "continue" then
+		clone = AstContinue(nil)
 
 	elseif nodeType == "label" then
 		clone = AstLabel(nil, node.name)
@@ -3317,7 +3410,7 @@ end
 
 
 local INVOLVED_NEVER  = newSet{ "function", "literal", "vararg" }
-local INVOLVED_ALWAYS = newSet{ "break", "call", "goto", "label", "lookup", "return" }
+local INVOLVED_ALWAYS = newSet{ "break", "continue", "call", "goto", "label", "lookup", "return" }
 
 local mayAnyNodeBeInvolvedInJump
 
@@ -3571,7 +3664,7 @@ local function traverseTree(node, leavesFirst, cb, parent, container, k)
 
 	local nodeType = node.type
 
-	if nodeType == "identifier" or nodeType == "vararg" or nodeType == "literal" or nodeType == "break" or nodeType == "label" or nodeType == "goto" then
+	if nodeType == "identifier" or nodeType == "vararg" or nodeType == "literal" or nodeType == "break" or nodeType == "continue" or nodeType == "label" or nodeType == "goto" then
 		-- void  No child nodes.
 
 	elseif nodeType == "table" then
@@ -3687,7 +3780,7 @@ local function traverseTreeReverse(node, leavesFirst, cb, parent, container, k)
 
 	local nodeType = node.type
 
-	if nodeType == "identifier" or nodeType == "vararg" or nodeType == "literal" or nodeType == "break" or nodeType == "label" or nodeType == "goto" then
+	if nodeType == "identifier" or nodeType == "vararg" or nodeType == "literal" or nodeType == "break" or nodeType == "continue" or nodeType == "label" or nodeType == "goto" then
 		-- void  No child nodes.
 
 	elseif nodeType == "table" then
@@ -5748,7 +5841,7 @@ do
 
 			if not maySafelyOmitParens then  lastOutput = writeLua(buffer, "(", "")  end -- @Polish: Only output parentheses around child unaries/binaries if associativity requires it.
 
-			if op == ".." or op == "and" or op == "or" or op == "+" or op == "*" or op == "&" or op == "|" then
+			if op == ".." or op == "and" or op == "or" or op == "+" or op == "*" or op == "&" or op == "|" or op == "||" or op == "&&" then
 				local ok;ok, lastOutput = writeBinaryOperatorChain(buffer, pretty, indent, lastOutput, binary, nodeCb)
 				if not ok then  return nil, lastOutput  end
 
@@ -5819,6 +5912,10 @@ do
 
 		elseif nodeType == "break" then
 			lastOutput = writeAlphanum(buffer, pretty, "break", lastOutput)
+			lastOutput = writeLua(buffer, ";", "")
+
+		elseif nodeType == "continue" then
+			lastOutput = writeAlphanum(buffer, pretty, "continue", lastOutput)
 			lastOutput = writeLua(buffer, ";", "")
 
 		elseif nodeType == "return" then
@@ -6312,6 +6409,9 @@ do
 			end
 
 		elseif nodeType == "break" then
+			-- void
+
+		elseif nodeType == "continue" then
 			-- void
 
 		elseif nodeType == "label" then
